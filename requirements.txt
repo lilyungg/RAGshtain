@@ -1,0 +1,7 @@
+faiss-cpu
+sentence-transformers
+datasets
+tqdm
+requests
+transformers
+torch
