@@ -146,6 +146,7 @@ def main():
         print("\nSources:")
         for d, score in docs[:3]:
             print(f"- {d['title']} (score={score:.4f})")
+            print(f"Chunk:\n{d['chunk']}\n")
         print("-" * 60)
 
 if __name__ == "__main__":
