@@ -10,7 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 #RUN pip install --no-cache-dir vllm
-COPY rag_cli.py rag_deepseek.py .env .
+COPY rag_deepseek.py .env .
 #COPY wiki_vllm_rag.py demo.py ./
 
 #ENV VLLM_CPU_KVCACHE_SPACE=20

@@ -1,312 +1,210 @@
+import json
 import os
 import pickle
-import faiss
-import numpy as np
-from bs4 import BeautifulSoup
-from datasets import load_dataset
-from sentence_transformers import SentenceTransformer
-from tqdm.auto import tqdm
-import requests
+from pathlib import Path
 
-INDEX_PATH = "data/wiki.index"
-META_PATH = "data/meta.pkl"
+import faiss
+import requests
+from sentence_transformers import SentenceTransformer
+
+INDEX_PATH = "data/merged.index"
+META_PATH = "data/merged_meta.pkl"
 EMB_MODEL = os.getenv("EMB_MODEL", "all-MiniLM-L6-v2")
+
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "256"))
 
-class WikiIndexer:
+
+def chunk_text(text: str, chunk_size=512, overlap=64):
+    words = (text or "").split()
+    step = max(1, chunk_size - overlap)
+    out = []
+    for i in range(0, len(words), step):
+        s = " ".join(words[i : i + chunk_size]).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+class MergedFaissIndex:
+    """
+    Cosine similarity with FAISS:
+      - IndexFlatIP (inner product)
+      - L2-normalize all vectors so dot product == cosine similarity.
+    """
     def __init__(self, model_name=EMB_MODEL, batch_size=32):
         self.model = SentenceTransformer(model_name)
         self.batch_size = batch_size
         self.index = None
-        self.metadata = []
+        self.meta = []
 
-    def chunk_text(self, text, chunk_size=512, overlap=50):
-        words = text.split()
-        step = max(1, chunk_size - overlap)
-        chunks = []
-        for i in range(0, len(words), step):
-            chunk = " ".join(words[i:i+chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
-        return chunks
+    def build(
+        self,
+        merged_json_path="examples/merged.json",
+        index_path=INDEX_PATH,
+        meta_path=META_PATH,
+        chunk_size=512,
+        overlap=64,
+    ):
+        items = json.loads(Path(merged_json_path).read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            raise TypeError("merged.json must be a JSON array (list of objects)")
 
-    def process_dataset(self, dataset, max_articles=None):
-        processed = []
-        articles = dataset[:max_articles] if max_articles else dataset
-        for art in tqdm(articles, desc="Processing"):
-            chunks = self.chunk_text(art["text"])
-            for c in chunks:
-                processed.append({
-                    "title": art["title"],
-                    "url": art.get("url", ""),
-                    "chunk": c
-                })
-        return processed
+        records = []
+        for obj in items:
+            text = obj.get("text") or ""
+            for j, ch in enumerate(chunk_text(text, chunk_size=chunk_size, overlap=overlap)):
+                ch = "" if ch is None else str(ch)
+                ch = ch.strip()
+                if not ch:
+                    continue
 
-    def build_index(self, data, index_path=INDEX_PATH, meta_path=META_PATH):
-        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+                records.append(
+                    {
+                        "document_title": obj.get("document_title"),
+                        "url": obj.get("url"),
+                        "section_title": obj.get("section_title"),
+                        "useful_links": obj.get("useful_links") or [],
+                        "chunk_id": j,
+                        "chunk": ch,
+                    }
+                )
+
+        if not records:
+            raise RuntimeError("No chunks were produced from merged.json (nothing to index).")
+
         d = self.model.get_sentence_embedding_dimension()
-        self.index = faiss.IndexFlatL2(d)
-        for i in tqdm(range(0, len(data), self.batch_size), desc="Indexing"):
-            batch = data[i:i+self.batch_size]
-            texts = [x["chunk"] for x in batch]
-            emb = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-            self.index.add(emb.astype("float32"))
-            self.metadata.extend(batch)
+        self.index = faiss.IndexFlatIP(d)  # cosine via normalized inner product [web:40]
+        self.meta = []
+
+        Path(index_path).parent.mkdir(parents=True, exist_ok=True)
+
+        for i in range(0, len(records), self.batch_size):
+            batch = records[i : i + self.batch_size]
+            texts = []
+            cleaned_batch = []
+
+            # extra safety: guarantee list[str] only
+            for x in batch:
+                t = x.get("chunk")
+                if t is None:
+                    continue
+                t = str(t).strip()
+                if not t:
+                    continue
+                texts.append(t)
+                cleaned_batch.append(x)
+
+            if not texts:
+                continue
+
+            emb = self.model.encode(texts, convert_to_numpy=True).astype("float32")
+            faiss.normalize_L2(emb)  # in-place normalization [web:31]
+            self.index.add(emb)
+            self.meta.extend(cleaned_batch)
+
+        if self.index.ntotal == 0:
+            raise RuntimeError("FAISS index is empty after build(). Check your merged.json content.")
+
         faiss.write_index(self.index, index_path)
         with open(meta_path, "wb") as f:
-            pickle.dump(self.metadata, f)
+            pickle.dump(self.meta, f)
 
     def load(self, index_path=INDEX_PATH, meta_path=META_PATH):
         self.index = faiss.read_index(index_path)
         with open(meta_path, "rb") as f:
-            self.metadata = pickle.load(f)
+            self.meta = pickle.load(f)
 
-    def search(self, query, k=5):
-        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
-        dist, idx = self.index.search(q_emb, k)
-        return [(self.metadata[i], dist[0][j]) for j, i in enumerate(idx[0])]
+    def search(self, query: str, k=3):
+        if query is None:
+            query = ""
+        query = str(query).strip()
+        if not query:
+            return []
+
+        q = self.model.encode([query], convert_to_numpy=True).astype("float32")
+        faiss.normalize_L2(q)  # normalize query as well [web:31]
+        scores, idx = self.index.search(q, k)  # inner product == cosine [web:40]
+
+        out = []
+        for rank, i in enumerate(idx[0]):
+            if i < 0:
+                continue
+            m = self.meta[int(i)]
+            out.append(
+                {
+                    "score_cosine": float(scores[0][rank]),
+                    "document_title": m.get("document_title"),
+                    "url": m.get("url"),
+                    "section_title": m.get("section_title"),
+                    "chunk": m.get("chunk"),
+                    "useful_links": m.get("useful_links"),
+                }
+            )
+        return out
+
 
 class DeepSeekRag:
-    def __init__(self, indexer: WikiIndexer):
+    def __init__(self, indexer: MergedFaissIndex):
         if not DEEPSEEK_API_KEY:
             raise RuntimeError("DEEPSEEK_API_KEY is not set")
         self.indexer = indexer
-        self.api_key = DEEPSEEK_API_KEY
-        self.model = DEEPSEEK_MODEL
 
-    def _call_deepseek(self, prompt: str) -> str:
-        url = "https://api.deepseek.com/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": MAX_TOKENS,
-            "temperature": 0.7,
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-    def query(self, question, k=5):
-        docs = self.indexer.search(question, k=k)
-        context = "\n\n".join(f"[{d['title']}]\n{d['chunk']}" for d, _ in docs)
-        prompt = (
-            "Answer the question based only on the context below.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {question}\nAnswer:"
+    def _call(self, messages, max_tokens=MAX_TOKENS, temperature=0.2) -> str:
+        r = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DEEPSEEK_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            timeout=60,
         )
-        answer = self._call_deepseek(prompt)
-        return answer, docs
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
 
-
-class HabrIndexer:
-    def __init__(self, model_name=EMB_MODEL, batch_size=32):
-        self.model = SentenceTransformer(model_name)
-        self.batch_size = batch_size
-        self.index = None
-        self.metadata = []
-
-    def chunk_text(self, text, chunk_size=512, overlap=50):
-        words = text.split()
-        step = max(1, chunk_size - overlap)
-        chunks = []
-        for i in range(0, len(words), step):
-            chunk = " ".join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append({"text": chunk, "metadata": {}})
-        return chunks
-
-    def process_dataset(self, links: list[str]):
-        processed = []
-
-        for link in tqdm(links, desc="Processing"):
-            response = requests.get(link, headers={
-                "User-Agent": "Mozilla/5.0"
-            })
-            html = response.text
-            soup = BeautifulSoup(html, "html.parser")
-
-            title_tag = soup.select_one("h1.tm-title span")
-            title = title_tag.text.strip() if title_tag else ""
-
-            content_block = soup.select_one("div.article-formatted-body")
-            if not content_block:
-                print(f"⚠️ Can't extract article text from {link}")
-                continue
-
-            article_text = " ".join([p.get_text(" ", strip=True) for p in content_block.find_all(["p", "li"])])
-
-            chunks = self.chunk_text(article_text)
-
-            for chunk in chunks:
-                processed.append({
-                    "source_type": "habr",
-                    "document_title": title,
-                    "url": link,
-                    "chunk": chunk
-                })
-
-        return processed
-
-    def build_index(self, data, index_path=INDEX_PATH, meta_path=META_PATH):
-        os.makedirs(os.path.dirname(index_path), exist_ok=True)
-        d = self.model.get_sentence_embedding_dimension()
-        self.index = faiss.IndexFlatL2(d)
-        for i in tqdm(range(0, len(data), self.batch_size), desc="Indexing"):
-            batch = data[i:i + self.batch_size]
-            texts = [x["chunk"] for x in batch]
-            emb = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-            self.index.add(emb.astype("float32"))
-            self.metadata.extend(batch)
-        faiss.write_index(self.index, index_path)
-        with open(meta_path, "wb") as f:
-            pickle.dump(self.metadata, f)
-
-    def load(self, index_path=INDEX_PATH, meta_path=META_PATH):
-        self.index = faiss.read_index(index_path)
-        with open(meta_path, "rb") as f:
-            self.metadata = pickle.load(f)
-
-    def search(self, query, k=5):
-        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
-        dist, idx = self.index.search(q_emb, k)
-        return [(self.metadata[i], dist[0][j]) for j, i in enumerate(idx[0])]
-
-
-class LenaVoitaIndexer:
-    def __init__(self, model_name=EMB_MODEL, batch_size=32):
-        self.model = SentenceTransformer(model_name)
-        self.batch_size = batch_size
-        self.index = None
-        self.metadata = []
-
-    def chunk_text(self, text, chunk_size=512, overlap=50):
-        words = text.split()
-        step = max(1, chunk_size - overlap)
-        chunks = []
-        for i in range(0, len(words), step):
-            chunk = " ".join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append({"text": chunk, "metadata": {}})
-        return chunks
-
-    def process_dataset(self, links: list[str]):
-        processed = []
-        for link in tqdm(links, desc="Processing"):
-            try:
-                response = requests.get(link, headers={"User-Agent": "Mozilla/5.0"})
-                html = response.text
-                soup = BeautifulSoup(html, "html.parser")
-
-                header_div = soup.select_one("div.header h1")
-                title = header_div.text.strip() if header_div else ""
-
-                main_content = soup.select_one("div#main_content.main_content")
-                if not main_content:
-                    print(f"⚠️ Can't find main content on {link}")
-                    continue
-
-                allowed_tags = ["p", "li", "h1", "h2", "h3", "h4", "span"]
-                content_parts = []
-                for tag in main_content.find_all(allowed_tags):
-
-                    text = tag.get_text(" ", strip=True)
-                    if text:
-                        content_parts.append(text)
-
-                article_text = " ".join(content_parts)
-
-                chunks = self.chunk_text(article_text)
-
-                for chunk in chunks:
-                    processed.append({
-                        "source_type": "lena_volta",
-                        "document_title": title,
-                        "url": link,
-                        "chunk": chunk
-                    })
-            except Exception as e:
-                print(f"Error processing {link}: {e}")
-                continue
-
-        return processed
-
-    def build_index(self, data, index_path=INDEX_PATH, meta_path=META_PATH):
-        os.makedirs(os.path.dirname(index_path), exist_ok=True)
-        d = self.model.get_sentence_embedding_dimension()
-        self.index = faiss.IndexFlatL2(d)
-        for i in tqdm(range(0, len(data), self.batch_size), desc="Indexing"):
-            batch = data[i:i + self.batch_size]
-            texts = [x["chunk"] for x in batch]
-            emb = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-            self.index.add(emb.astype("float32"))
-            self.metadata.extend(batch)
-        faiss.write_index(self.index, index_path)
-        with open(meta_path, "wb") as f:
-            pickle.dump(self.metadata, f)
-
-    def load(self, index_path=INDEX_PATH, meta_path=META_PATH):
-        self.index = faiss.read_index(index_path)
-        with open(meta_path, "rb") as f:
-            self.metadata = pickle.load(f)
-
-    def search(self, query, k=5):
-        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
-        dist, idx = self.index.search(q_emb, k)
-        return [(self.metadata[i], dist[0][j]) for j, i in enumerate(idx[0])]
+    def answer(self, question: str, k=3):
+        hits = self.indexer.search(question, k=k)
+        context = "\n\n".join(
+            f"[{h['document_title']} | {h['section_title']}]\n{h['chunk']}"
+            for h in hits
+            if h.get("chunk")
+        )
+        messages = [
+            {"role": "system", "content": "Answer using only the provided context."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"},
+        ]
+        return self._call(messages), hits
 
 
 def main():
-    indexer = WikiIndexer()
-    if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH):
-        print("Loading existing index...")
-        indexer.load()
+    ix = MergedFaissIndex()
+
+    if Path(INDEX_PATH).exists() and Path(META_PATH).exists():
+        ix.load()
     else:
-        print("Building index from EPSTEIN_FILES_20K...")
-        ds = load_dataset("tensonaut/EPSTEIN_FILES_20K", split="train")
-        # Этот датасет: поля file_name, text, возможно "length" и др.
-        records = []
-        for row in ds:
-            text = row.get("text") or row.get("content") or ""
-            if not text.strip():
-                continue
-            title = row.get("file_name") or row.get("id") or "EPSTEIN_DOC"
-            url = ""  # URL нет
-            records.append({"title": title, "url": url, "text": text})
+        ix.build("examples/merged.json")
 
-        data = indexer.process_dataset(records)
-        indexer.build_index(data)
-        print("Index built.")
+    rag = DeepSeekRag(ix)
 
-    rag = DeepSeekRag(indexer)
-    print("RAG ready. Type your question (or /exit):")
     while True:
-        try:
-            q = input("Q> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            break
-        if not q:
-            continue
+        q = input("Q> ").strip()
         if q in ("/exit", "/quit"):
-            print("Bye.")
             break
-        answer, docs = rag.query(q)
-        print("\nA>", answer)
-        print("\nSources:")
-        for d, score in docs[:3]:
-            print(f"- {d['title']} (score={score:.4f})")
-            print(f"Chunk:\n{d['chunk']}\n")
-        print("-" * 60)
+        ans, hits = rag.answer(q, k=3)
+        print("\nA>", ans)
+        print("\nTop-3 sources:")
+        for h in hits:
+            print(f"- {h['document_title']} | {h['section_title']}")
+            print(f"  {h['url']}")
+            print(f"  score_cosine={h['score_cosine']:.4f}\n")
+
 
 if __name__ == "__main__":
     main()

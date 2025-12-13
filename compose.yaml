@@ -1,0 +1,14 @@
+services:
+  rag:
+    image: baseline_rag
+    tty: true
+    stdin_open: true
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./examples:/examples
+      - ./data:/data
+    command: bash
+    
