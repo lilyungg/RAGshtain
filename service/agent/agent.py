@@ -242,11 +242,24 @@ FINALIZER = ChatPromptTemplate.from_messages([
 
 
 # MAIN
-def agent_main(user_input: Union[str, Dict[str, Any]], search_clien) -> str:
+def agent_main(user_input: Union[str, Dict[str, Any]],
+             search_clien,
+             history: Optional[Dict[str, Any]] = None) -> str:
     if isinstance(user_input, dict):
         user_text = str(user_input.get("text") or user_input.get("query") or user_input.get("message") or "").strip()
     else:
         user_text = str(user_input or "").strip()
+
+    history_str = ""
+    if history:
+        try:
+            history_str = json.dumps(history, ensure_ascii=False, indent=2)
+        except Exception:
+            history_str = str(history)
+
+    if history_str:
+        user_text = f"История переписки (json):\n{history_str}\n\nТекущий запрос:\n{user_text}".strip()
+
 
     if not user_text:
         return "Пустой запрос. Напиши вопрос или тему."
