@@ -7,8 +7,8 @@ import faiss
 import requests
 from sentence_transformers import SentenceTransformer
 
-INDEX_PATH = "data/e5-large/merged.index"
-META_PATH = "data/e5-large/merged_meta.pkl"
+INDEX_PATH = "C:\\Users\garan\PycharmProjects\RAGshtain\data\e5-large\merged.index"
+META_PATH = "C:\\Users\garan\PycharmProjects\RAGshtain\data\e5-large\merged_meta.pkl"
 EMB_MODEL = os.getenv("EMB_MODEL", "intfloat/multilingual-e5-large")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
